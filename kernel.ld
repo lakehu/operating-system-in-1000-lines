@@ -1,7 +1,7 @@
 ENTRY(boot)
 
 SECTIONS {
-    . = 0x80200000;
+    . = 0x40200000; /* QEMU virt RAM starts at 0x40000000 */
     __kernel_base = .;
 
     .text :{
@@ -23,9 +23,12 @@ SECTIONS {
         __bss_end = .;
     }
 
-    . = ALIGN(4);
+    . = ALIGN(8);
     . += 128 * 1024; /* 128KB */
     __stack_top = .;
+
+    . += 4 * 1024; /* abort/undefined mode stack */
+    __exception_stack_top = .;
 
     . = ALIGN(4096);
     __free_ram = .;

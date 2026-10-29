@@ -3,6 +3,7 @@
 
 extern char __kernel_base[];
 extern char __stack_top[];
+extern char __exception_stack_top[];
 extern char __bss[], __bss_end[];
 extern char __free_ram[], __free_ram_end[];
 extern char _binary_shell_bin_start[], _binary_shell_bin_size[];
@@ -23,6 +24,12 @@ paddr_t alloc_pages(uint32_t n) {
     return paddr;
 }
 
+uint32_t *alloc_l1_table(void) {
+    // TTBR0 requires a 16KB-aligned L1 table. Over-allocate and align.
+    paddr_t paddr = alloc_pages(L1_TABLE_SIZE * 2 / PAGE_SIZE);
+    return (uint32_t *) align_up(paddr, L1_TABLE_SIZE);
+}
+
 void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
     if (!is_aligned(vaddr, PAGE_SIZE))
         PANIC("unaligned vaddr %x", vaddr);
@@ -30,34 +37,21 @@ void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
     if (!is_aligned(paddr, PAGE_SIZE))
         PANIC("unaligned paddr %x", paddr);
 
-    uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
-    if ((table1[vpn1] & PAGE_V) == 0) {
+    uint32_t index1 = vaddr >> 20;
+    if ((table1[index1] & 0x3) == 0) {
+        // An L2 table is 1KB (256 entries); a whole page is used for simplicity.
         uint32_t pt_paddr = alloc_pages(1);
-        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+        table1[index1] = pt_paddr | L1_TYPE_TABLE;
     }
 
-    uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
-    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
-    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
-}
-
-struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
-                       long arg5, long fid, long eid) {
-    register long a0 __asm__("a0") = arg0;
-    register long a1 __asm__("a1") = arg1;
-    register long a2 __asm__("a2") = arg2;
-    register long a3 __asm__("a3") = arg3;
-    register long a4 __asm__("a4") = arg4;
-    register long a5 __asm__("a5") = arg5;
-    register long a6 __asm__("a6") = fid;
-    register long a7 __asm__("a7") = eid;
-
-    __asm__ __volatile__("ecall"
-                         : "=r"(a0), "=r"(a1)
-                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5),
-                           "r"(a6), "r"(a7)
-                         : "memory");
-    return (struct sbiret){.error = a0, .value = a1};
+    uint32_t index2 = (vaddr >> 12) & 0xff;
+    uint32_t *table2 = (uint32_t *) (table1[index1] & ~0x3ff);
+    uint32_t entry = paddr | L2_TYPE_SMALL;
+    entry |= (flags & PAGE_U) ? L2_AP_ALL_RW : L2_AP_PRIV_RW;
+    entry |= (flags & PAGE_DEVICE) ? L2_B : L2_TEX_NORMAL;
+    if (!(flags & PAGE_X))
+        entry |= L2_XN;
+    table2[index2] = entry;
 }
 
 struct virtio_virtq *blk_request_vq;
@@ -259,140 +253,91 @@ struct file *fs_lookup(const char *filename) {
 }
 
 void putchar(char ch) {
-    sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
+    volatile uint32_t *uart = (volatile uint32_t *) UART_PADDR;
+    while (uart[UART_FR / 4] & UART_FR_TXFF)
+        ;
+    uart[UART_DR / 4] = ch;
 }
 
 long getchar(void) {
-    struct sbiret ret = sbi_call(0, 0, 0, 0, 0, 0, 0, 2);
-    return ret.error;
+    volatile uint32_t *uart = (volatile uint32_t *) UART_PADDR;
+    if (uart[UART_FR / 4] & UART_FR_RXFE)
+        return -1;
+    return uart[UART_DR / 4] & 0xff;
 }
 
+__attribute__((naked))
+__attribute__((aligned(32)))
+void vectors(void) {
+    __asm__ __volatile__(
+        "b .\n"             // reset
+        "b undef_entry\n"   // undefined instruction
+        "b kernel_entry\n"  // supervisor call (svc)
+        "b pabt_entry\n"    // prefetch abort
+        "b dabt_entry\n"    // data abort
+        "b .\n"             // reserved
+        "b .\n"             // IRQ
+        "b .\n"             // FIQ
+    );
+}
+
+// Faults run on their own mode's stack (set up in boot) and never return.
+__attribute__((naked)) void undef_entry(void) {
+    __asm__ __volatile__("mov r0, #1\n sub r1, lr, #4\n b handle_fault\n");
+}
+
+__attribute__((naked)) void pabt_entry(void) {
+    __asm__ __volatile__("mov r0, #3\n sub r1, lr, #4\n b handle_fault\n");
+}
+
+__attribute__((naked)) void dabt_entry(void) {
+    __asm__ __volatile__("mov r0, #4\n sub r1, lr, #8\n b handle_fault\n");
+}
+
+// On svc, the CPU switches to SVC mode, whose banked sp already points to the
+// top of the current process's kernel stack. lr_svc holds the return address
+// and spsr_svc the user CPSR.
 __attribute__((naked))
 __attribute__((aligned(4)))
 void kernel_entry(void) {
     __asm__ __volatile__(
-        "csrrw sp, sscratch, sp\n"
-        "addi sp, sp, -4 * 31\n"
-        "sw ra,  4 * 0(sp)\n"
-        "sw gp,  4 * 1(sp)\n"
-        "sw tp,  4 * 2(sp)\n"
-        "sw t0,  4 * 3(sp)\n"
-        "sw t1,  4 * 4(sp)\n"
-        "sw t2,  4 * 5(sp)\n"
-        "sw t3,  4 * 6(sp)\n"
-        "sw t4,  4 * 7(sp)\n"
-        "sw t5,  4 * 8(sp)\n"
-        "sw t6,  4 * 9(sp)\n"
-        "sw a0,  4 * 10(sp)\n"
-        "sw a1,  4 * 11(sp)\n"
-        "sw a2,  4 * 12(sp)\n"
-        "sw a3,  4 * 13(sp)\n"
-        "sw a4,  4 * 14(sp)\n"
-        "sw a5,  4 * 15(sp)\n"
-        "sw a6,  4 * 16(sp)\n"
-        "sw a7,  4 * 17(sp)\n"
-        "sw s0,  4 * 18(sp)\n"
-        "sw s1,  4 * 19(sp)\n"
-        "sw s2,  4 * 20(sp)\n"
-        "sw s3,  4 * 21(sp)\n"
-        "sw s4,  4 * 22(sp)\n"
-        "sw s5,  4 * 23(sp)\n"
-        "sw s6,  4 * 24(sp)\n"
-        "sw s7,  4 * 25(sp)\n"
-        "sw s8,  4 * 26(sp)\n"
-        "sw s9,  4 * 27(sp)\n"
-        "sw s10, 4 * 28(sp)\n"
-        "sw s11, 4 * 29(sp)\n"
+        "srsdb sp!, #0x13\n"       // push lr_svc (user pc) and spsr_svc
+        "sub sp, sp, #4\n"         // pad
+        "stmdb sp, {sp, lr}^\n"    // user sp and lr
+        "sub sp, sp, #8\n"
+        "stmdb sp!, {r0-r12}\n"
 
-        "csrr a0, sscratch\n"
-        "sw a0,  4 * 30(sp)\n"
+        "mov r0, sp\n"
+        "bl handle_trap\n"
 
-        "addi a0, sp, 4 * 31\n"
-        "csrw sscratch, a0\n"
-
-        "mv a0, sp\n"
-        "call handle_trap\n"
-
-        "lw ra,  4 * 0(sp)\n"
-        "lw gp,  4 * 1(sp)\n"
-        "lw tp,  4 * 2(sp)\n"
-        "lw t0,  4 * 3(sp)\n"
-        "lw t1,  4 * 4(sp)\n"
-        "lw t2,  4 * 5(sp)\n"
-        "lw t3,  4 * 6(sp)\n"
-        "lw t4,  4 * 7(sp)\n"
-        "lw t5,  4 * 8(sp)\n"
-        "lw t6,  4 * 9(sp)\n"
-        "lw a0,  4 * 10(sp)\n"
-        "lw a1,  4 * 11(sp)\n"
-        "lw a2,  4 * 12(sp)\n"
-        "lw a3,  4 * 13(sp)\n"
-        "lw a4,  4 * 14(sp)\n"
-        "lw a5,  4 * 15(sp)\n"
-        "lw a6,  4 * 16(sp)\n"
-        "lw a7,  4 * 17(sp)\n"
-        "lw s0,  4 * 18(sp)\n"
-        "lw s1,  4 * 19(sp)\n"
-        "lw s2,  4 * 20(sp)\n"
-        "lw s3,  4 * 21(sp)\n"
-        "lw s4,  4 * 22(sp)\n"
-        "lw s5,  4 * 23(sp)\n"
-        "lw s6,  4 * 24(sp)\n"
-        "lw s7,  4 * 25(sp)\n"
-        "lw s8,  4 * 26(sp)\n"
-        "lw s9,  4 * 27(sp)\n"
-        "lw s10, 4 * 28(sp)\n"
-        "lw s11, 4 * 29(sp)\n"
-        "lw sp,  4 * 30(sp)\n"
-        "sret\n"
+        "ldmia sp!, {r0-r12}\n"
+        "ldmia sp, {sp, lr}^\n"
+        "nop\n"
+        "add sp, sp, #12\n"
+        "rfeia sp!\n"              // pop pc and cpsr: back to user mode
     );
 }
 
 __attribute__((naked)) void user_entry(void) {
     __asm__ __volatile__(
-        "csrw sepc, %[sepc]\n"
-        "csrw sstatus, %[sstatus]\n"
-        "sret\n"
+        "mov r0, %[spsr]\n"
+        "msr spsr_cxsf, r0\n"
+        "mov lr, %[pc]\n"
+        "movs pc, lr\n"            // jump to user mode
         :
-        : [sepc] "r" (USER_BASE),
-          [sstatus] "r" (SSTATUS_SPIE | SSTATUS_SUM)
+        : [pc] "i" (USER_BASE),
+          [spsr] "i" (CPSR_MODE_USR | 0xc0 /* IRQ and FIQ masked */)
     );
 }
 
 __attribute__((naked)) void switch_context(uint32_t *prev_sp,
                                            uint32_t *next_sp) {
     __asm__ __volatile__(
-        "addi sp, sp, -13 * 4\n"
-        "sw ra,  0  * 4(sp)\n"
-        "sw s0,  1  * 4(sp)\n"
-        "sw s1,  2  * 4(sp)\n"
-        "sw s2,  3  * 4(sp)\n"
-        "sw s3,  4  * 4(sp)\n"
-        "sw s4,  5  * 4(sp)\n"
-        "sw s5,  6  * 4(sp)\n"
-        "sw s6,  7  * 4(sp)\n"
-        "sw s7,  8  * 4(sp)\n"
-        "sw s8,  9  * 4(sp)\n"
-        "sw s9,  10 * 4(sp)\n"
-        "sw s10, 11 * 4(sp)\n"
-        "sw s11, 12 * 4(sp)\n"
-        "sw sp, (a0)\n"
-        "lw sp, (a1)\n"
-        "lw ra,  0  * 4(sp)\n"
-        "lw s0,  1  * 4(sp)\n"
-        "lw s1,  2  * 4(sp)\n"
-        "lw s2,  3  * 4(sp)\n"
-        "lw s3,  4  * 4(sp)\n"
-        "lw s4,  5  * 4(sp)\n"
-        "lw s5,  6  * 4(sp)\n"
-        "lw s6,  7  * 4(sp)\n"
-        "lw s7,  8  * 4(sp)\n"
-        "lw s8,  9  * 4(sp)\n"
-        "lw s9,  10 * 4(sp)\n"
-        "lw s10, 11 * 4(sp)\n"
-        "lw s11, 12 * 4(sp)\n"
-        "addi sp, sp, 13 * 4\n"
-        "ret\n"
+        "push {r4-r12, lr}\n"
+        "str sp, [r0]\n"
+        "ldr sp, [r1]\n"
+        "pop {r4-r12, lr}\n"
+        "bx lr\n"
     );
 }
 
@@ -410,29 +355,28 @@ struct process *create_process(const void *image, size_t image_size) {
         PANIC("no free process slots");
 
     uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
-    *--sp = 0;                      // s11
-    *--sp = 0;                      // s10
-    *--sp = 0;                      // s9
-    *--sp = 0;                      // s8
-    *--sp = 0;                      // s7
-    *--sp = 0;                      // s6
-    *--sp = 0;                      // s5
-    *--sp = 0;                      // s4
-    *--sp = 0;                      // s3
-    *--sp = 0;                      // s2
-    *--sp = 0;                      // s1
-    *--sp = 0;                      // s0
-    *--sp = (uint32_t) user_entry;  // ra
+    *--sp = (uint32_t) user_entry;  // lr
+    *--sp = 0;                      // r12
+    *--sp = 0;                      // r11
+    *--sp = 0;                      // r10
+    *--sp = 0;                      // r9
+    *--sp = 0;                      // r8
+    *--sp = 0;                      // r7
+    *--sp = 0;                      // r6
+    *--sp = 0;                      // r5
+    *--sp = 0;                      // r4
 
-    uint32_t *page_table = (uint32_t *) alloc_pages(1);
+    uint32_t *page_table = alloc_l1_table();
 
     // Kernel pages.
     for (paddr_t paddr = (paddr_t) __kernel_base;
          paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
         map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 
-    // virtio-blk
-    map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_R | PAGE_W);
+    // UART and virtio-blk
+    map_page(page_table, UART_PADDR, UART_PADDR, PAGE_R | PAGE_W | PAGE_DEVICE);
+    map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR,
+             PAGE_R | PAGE_W | PAGE_DEVICE);
 
     // User pages.
     for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
@@ -467,29 +411,27 @@ void yield(void) {
     struct process *prev = current_proc;
     current_proc = next;
 
-    __asm__ __volatile__(
-        "sfence.vma\n"
-        "csrw satp, %[satp]\n"
-        "sfence.vma\n"
-        "csrw sscratch, %[sscratch]\n"
-        :
-        : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)),
-          [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
-    );
+    __asm__ __volatile__("dsb\n" ::: "memory");
+    WRITE_CP15(c2, 0, c0, 0, (uint32_t) next->page_table); // TTBR0
+    WRITE_CP15(c8, 0, c7, 0, 0);                            // TLBIALL
+    __asm__ __volatile__("dsb\nisb\n" ::: "memory");
+    // Enable the MMU (only changes something on the first switch).
+    WRITE_CP15(c1, 0, c0, 0, READ_CP15(c1, 0, c0, 0) | SCTLR_M);
+    __asm__ __volatile__("isb\n" ::: "memory");
 
     switch_context(&prev->sp, &next->sp);
 }
 
 void handle_syscall(struct trap_frame *f) {
-    switch (f->a3) {
+    switch (f->r3) {
         case SYS_PUTCHAR:
-            putchar(f->a0);
+            putchar(f->r0);
             break;
         case SYS_GETCHAR:
             while (1) {
                 long ch = getchar();
                 if (ch >= 0) {
-                    f->a0 = ch;
+                    f->r0 = ch;
                     break;
                 }
 
@@ -503,20 +445,20 @@ void handle_syscall(struct trap_frame *f) {
             PANIC("unreachable");
         case SYS_READFILE:
         case SYS_WRITEFILE: {
-            const char *filename = (const char *) f->a0;
-            char *buf = (char *) f->a1;
-            int len = f->a2;
+            const char *filename = (const char *) f->r0;
+            char *buf = (char *) f->r1;
+            int len = f->r2;
             struct file *file = fs_lookup(filename);
             if (!file) {
                 printf("file not found: %s\n", filename);
-                f->a0 = -1;
+                f->r0 = -1;
                 break;
             }
 
             if (len > (int) sizeof(file->data))
                 len = file->size;
 
-            if (f->a3 == SYS_WRITEFILE) {
+            if (f->r3 == SYS_WRITEFILE) {
                 memcpy(file->data, buf, len);
                 file->size = len;
                 fs_flush();
@@ -524,32 +466,31 @@ void handle_syscall(struct trap_frame *f) {
                 memcpy(buf, file->data, len);
             }
 
-            f->a0 = len;
+            f->r0 = len;
             break;
         }
         default:
-            PANIC("unexpected syscall a3=%x\n", f->a3);
+            PANIC("unexpected syscall r3=%x\n", f->r3);
     }
 }
 
 void handle_trap(struct trap_frame *f) {
-    uint32_t scause = READ_CSR(scause);
-    uint32_t stval = READ_CSR(stval);
-    uint32_t user_pc = READ_CSR(sepc);
-    if (scause == SCAUSE_ECALL) {
-        handle_syscall(f);
-        user_pc += 4;
-    } else {
-        PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
-    }
+    // Only svc is routed here; f->pc already points past the svc instruction.
+    handle_syscall(f);
+}
 
-    WRITE_CSR(sepc, user_pc);
+void handle_fault(uint32_t type, uint32_t pc) {
+    PANIC("unexpected exception type=%d, pc=%x, dfsr=%x, dfar=%x, ifsr=%x, ifar=%x",
+          type, pc, READ_CP15(c5, 0, c0, 0), READ_CP15(c6, 0, c0, 0),
+          READ_CP15(c5, 0, c0, 1), READ_CP15(c6, 0, c0, 2));
 }
 
 void kernel_main(void) {
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
     printf("\n\n");
-    WRITE_CSR(stvec, (uint32_t) kernel_entry);
+    WRITE_CP15(c12, 0, c0, 0, (uint32_t) vectors); // VBAR
+    WRITE_CP15(c2, 0, c0, 2, 0);                    // TTBCR: always use TTBR0
+    WRITE_CP15(c3, 0, c0, 0, 1);                    // DACR: domain 0 is client
     virtio_blk_init();
     fs_init();
 
@@ -567,9 +508,12 @@ __attribute__((section(".text.boot")))
 __attribute__((naked))
 void boot(void) {
     __asm__ __volatile__(
-        "mv sp, %[stack_top]\n"
-        "j kernel_main\n"
-        :
-        : [stack_top] "r" (__stack_top)
+        "cps #0x17\n"                      // abort mode
+        "ldr sp, =__exception_stack_top\n"
+        "cps #0x1b\n"                      // undefined mode
+        "ldr sp, =__exception_stack_top\n"
+        "cps #0x13\n"                      // supervisor mode
+        "ldr sp, =__stack_top\n"
+        "b kernel_main\n"
     );
 }

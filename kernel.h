@@ -5,22 +5,34 @@
 #define PROC_UNUSED   0
 #define PROC_RUNNABLE 1
 #define PROC_EXITED   2
-#define SATP_SV32 (1u << 31)
-#define SSTATUS_SPIE (1 << 5)
-#define SSTATUS_SUM  (1 << 18)
-#define SCAUSE_ECALL 8
-#define PAGE_V    (1 << 0)
+#define CPSR_MODE_USR 0x10
+#define CPSR_MODE_SVC 0x13
+#define SCTLR_M       (1 << 0)
 #define PAGE_R    (1 << 1)
 #define PAGE_W    (1 << 2)
 #define PAGE_X    (1 << 3)
 #define PAGE_U    (1 << 4)
+#define PAGE_DEVICE (1 << 5)
+#define L1_TABLE_SIZE   (16 * 1024) // 4096 entries, 1MB each
+#define L1_TYPE_TABLE   0x1
+#define L2_TYPE_SMALL   0x2
+#define L2_XN           (1 << 0)
+#define L2_B            (1 << 2)
+#define L2_AP_PRIV_RW   (1 << 4)    // AP[1:0]=01: kernel RW, user no access
+#define L2_AP_ALL_RW    (3 << 4)    // AP[1:0]=11: kernel and user RW
+#define L2_TEX_NORMAL   (1 << 6)    // TEX=001, C=0, B=0: normal non-cacheable
+#define UART_PADDR      0x09000000  // PL011
+#define UART_DR         0x00
+#define UART_FR         0x18
+#define UART_FR_RXFE    (1 << 4)
+#define UART_FR_TXFF    (1 << 5)
 #define USER_BASE 0x1000000
 #define FILES_MAX   2
 #define DISK_MAX_SIZE     align_up(sizeof(struct file) * FILES_MAX, SECTOR_SIZE)
 #define SECTOR_SIZE       512
 #define VIRTQ_ENTRY_NUM   16
 #define VIRTIO_DEVICE_BLK 2
-#define VIRTIO_BLK_PADDR  0x10001000
+#define VIRTIO_BLK_PADDR  0x0a000000
 #define VIRTIO_REG_MAGIC         0x00
 #define VIRTIO_REG_VERSION       0x04
 #define VIRTIO_REG_DEVICE_ID     0x08
@@ -46,46 +58,28 @@ struct process {
     int state; // PROC_UNUSED, PROC_RUNNABLE, PROC_EXITED
     vaddr_t sp; // kernel stack pointer
     uint32_t *page_table; // points to first level page table
-    uint8_t stack[8192]; // kernel stack
-};
-
-struct sbiret {
-    long error;
-    long value;
+    uint8_t stack[8192] __attribute__((aligned(8))); // kernel stack
 };
 
 struct trap_frame {
-    uint32_t ra;
-    uint32_t gp;
-    uint32_t tp;
-    uint32_t t0;
-    uint32_t t1;
-    uint32_t t2;
-    uint32_t t3;
-    uint32_t t4;
-    uint32_t t5;
-    uint32_t t6;
-    uint32_t a0;
-    uint32_t a1;
-    uint32_t a2;
-    uint32_t a3;
-    uint32_t a4;
-    uint32_t a5;
-    uint32_t a6;
-    uint32_t a7;
-    uint32_t s0;
-    uint32_t s1;
-    uint32_t s2;
-    uint32_t s3;
-    uint32_t s4;
-    uint32_t s5;
-    uint32_t s6;
-    uint32_t s7;
-    uint32_t s8;
-    uint32_t s9;
-    uint32_t s10;
-    uint32_t s11;
-    uint32_t sp;
+    uint32_t r0;
+    uint32_t r1;
+    uint32_t r2;
+    uint32_t r3;
+    uint32_t r4;
+    uint32_t r5;
+    uint32_t r6;
+    uint32_t r7;
+    uint32_t r8;
+    uint32_t r9;
+    uint32_t r10;
+    uint32_t r11;
+    uint32_t r12;
+    uint32_t sp;   // user sp
+    uint32_t lr;   // user lr
+    uint32_t pad;  // keeps the frame 8-byte aligned
+    uint32_t pc;   // return address (lr_svc)
+    uint32_t spsr;
 } __attribute__((packed));
 
 struct virtq_desc {
@@ -157,17 +151,19 @@ struct file {
     size_t size;
 };
 
-#define READ_CSR(reg)                                                          \
+#define READ_CP15(crn, op1, crm, op2)                                          \
     ({                                                                         \
-        unsigned long __tmp;                                                   \
-        __asm__ __volatile__("csrr %0, " #reg : "=r"(__tmp));                  \
+        uint32_t __tmp;                                                        \
+        __asm__ __volatile__("mrc p15, " #op1 ", %0, " #crn ", " #crm ", " #op2 \
+                             : "=r"(__tmp));                                   \
         __tmp;                                                                 \
     })
 
-#define WRITE_CSR(reg, value)                                                  \
+#define WRITE_CP15(crn, op1, crm, op2, value)                                  \
     do {                                                                       \
         uint32_t __tmp = (value);                                              \
-        __asm__ __volatile__("csrw " #reg ", %0" ::"r"(__tmp));                \
+        __asm__ __volatile__("mcr p15, " #op1 ", %0, " #crn ", " #crm ", " #op2 \
+                             ::"r"(__tmp));                                    \
     } while (0)
 
 #define PANIC(fmt, ...)                                                        \
